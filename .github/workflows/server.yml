@@ -1,0 +1,388 @@
+name: MCSM Node
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install OpenSSH, set Java 25, MCSM & bore
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          TTL_MIN=360
+          TTL_SEC=$(( TTL_MIN * 60 ))
+
+          # 固定端口：MCSM 面板 + 常见 MC 端口（后面都走 bore，写到 web.txt）
+          PORT_LIST_STR="23333 24444 25565"
+
+          echo ">>> TTL (minutes): $TTL_MIN"
+          echo ">>> Extra TCP ports to expose via bore: ${PORT_LIST_STR:-<none>}"
+
+          echo ">>> Install OpenSSH, curl, openssl, parted, rsync (不再安装 Java)"
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y openssh-server curl openssl parted e2fsprogs rsync
+          elif command -v yum >/dev/null 2>&1; then
+            sudo yum install -y openssh-server curl openssl parted e2fsprogs rsync
+          else
+            echo "Unsupported package manager, please install openssh-server, curl, openssl, parted, e2fsprogs, rsync manually."
+            exit 1
+          fi
+
+          # ===== 先干掉原有 swap，再用根分区剩余空间做新的 swap =====
+          echo ">>> Disable existing swap and remove old swap files (if any)"
+
+          EXISTING_SWAPS="$(swapon --show=NAME,TYPE --noheadings 2>/dev/null || true)"
+
+          if [ -n "$EXISTING_SWAPS" ]; then
+            echo "Current swaps:"
+            echo "$EXISTING_SWAPS"
+
+            # 先全部关闭
+            sudo swapoff -a || true
+
+            # 删除类型为 file 的 swap（/swapfile /swap.img 等）
+            while read -r DEV TYPE; do
+              [ -z "${DEV:-}" ] && continue
+              if [ "$TYPE" = "file" ] && [ -f "$DEV" ]; then
+                echo "  - removing swap file $DEV"
+                sudo rm -f "$DEV" || true
+              else
+                echo "  - keep swap device $DEV (type=$TYPE, probably a partition)"
+              fi
+            done <<< "$EXISTING_SWAPS"
+          else
+            echo "No existing swap found."
+          fi
+
+          # ===== 系统盘：用根分区的剩余空间做临时 swap，只保留 1G 空闲，swappiness=80 =====
+          echo ">>> Configure temporary swap on root filesystem (keep 1G free, swappiness=80)"
+          ROOT_MOUNT="/"
+          FREE_KB=$(df --output=avail -k "$ROOT_MOUNT" | tail -n 1 | tr -d ' ')
+          FREE_MB=$(( FREE_KB / 1024 ))
+
+          if [ "$FREE_MB" -le 1024 ]; then
+            echo "!!! Not enough free space on root filesystem (<=1G), skip swap setup."
+          else
+            # 预留 1G
+            SWAP_MB=$(( FREE_MB - 1024 ))
+            SWAP_GB=$(( SWAP_MB / 1024 ))
+
+            if [ "$SWAP_GB" -lt 1 ]; then
+              echo "!!! Remaining space after reserving 1G is <1G, skip swap setup."
+            else
+              SWAPFILE="/swapfile_mcsm"
+              echo ">>> Free: ${FREE_MB}MB, creating swap: ${SWAP_GB}G at ${SWAPFILE}"
+
+              if ! sudo fallocate -l "${SWAP_GB}G" "$SWAPFILE" 2>/dev/null; then
+                echo "fallocate failed, fallback to dd ..."
+                sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count="$SWAP_MB" status=progress
+              fi
+
+              sudo chmod 600 "$SWAPFILE"
+              sudo mkswap "$SWAPFILE"
+              sudo swapon "$SWAPFILE"
+
+              # 设置积极性（swappiness）= 80
+              sudo sysctl -w vm.swappiness=80 || true
+
+              echo ">>> Swap configured:"
+              free -h || true
+              swapon --show || true
+            fi
+          fi
+
+          echo ">>> Set default Java to temurin-25 (如果存在)"
+          if command -v update-alternatives >/dev/null 2>&1; then
+            if update-alternatives --list java 2>/dev/null | grep -q 'temurin-25-jdk-amd64/bin/java'; then
+              if sudo update-alternatives --set java /usr/lib/jvm/temurin-25-jdk-amd64/bin/java; then
+                echo ">>> Switched default java to /usr/lib/jvm/temurin-25-jdk-amd64/bin/java"
+              else
+                echo "!!! Failed to set java to temurin-25, keep current default"
+              fi
+            else
+              echo "!!! temurin-25-jdk-amd64 not found in update-alternatives, keep existing default java"
+            fi
+          else
+            echo "update-alternatives command not found, skip setting default java"
+          fi
+
+          echo ">>> Java version (after switch, if成功):"
+          java -version || true
+
+          # ===== 准备数据盘：统一挂载到 /mnt =====
+          echo ">>> Prepare data disk (mountpoint: /mnt)"
+
+          if mountpoint -q /mnt; then
+            echo ">>> /mnt is already a mountpoint, use it as data disk."
+          else
+            echo ">>> /mnt is not mounted, trying to find a non-root disk for data..."
+
+            ROOT_DEV="$(findmnt -no SOURCE /)"
+            ROOT_DISK="$(lsblk -no PKNAME "$ROOT_DEV" 2>/dev/null || true)"
+            if [ -z "$ROOT_DISK" ]; then
+              ROOT_DISK="$(basename "$ROOT_DEV" | sed 's/[0-9]*$//')"
+            fi
+            echo "Root device: $ROOT_DEV (base disk: $ROOT_DISK)"
+
+            DATA_DISK=""
+            while read -r disk type; do
+              disk_base="$(basename "$disk")"
+              if [ "$type" = "disk" ] && [ "$disk_base" != "$ROOT_DISK" ]; then
+                DATA_DISK="$disk"
+                break
+              fi
+            done < <(lsblk -dpno NAME,TYPE)
+
+            if [ -z "$DATA_DISK" ]; then
+              echo "!!! No separate data disk found. Creating /mnt on root filesystem (not ideal, but continue)."
+              sudo mkdir -p /mnt
+            else
+              echo ">>> Found data disk: $DATA_DISK"
+
+              # 检查是否已经有分区
+              PARTS="$(lsblk -nrpo NAME "$DATA_DISK" | tail -n +2 || true)"
+
+              if [ -z "$PARTS" ]; then
+                echo ">>> No partitions on $DATA_DISK, creating a single ext4 partition..."
+                sudo parted -s "$DATA_DISK" mklabel gpt
+                sudo parted -s "$DATA_DISK" mkpart primary ext4 0% 100%
+                sleep 2
+                PARTS="$(lsblk -nrpo NAME "$DATA_DISK" | tail -n +2 || true)"
+              fi
+
+              DATA_PART="$(echo "$PARTS" | head -n 1)"
+              echo ">>> Use partition: $DATA_PART"
+
+              FSTYPE="$(lsblk -no FSTYPE "$DATA_PART" | tr -d ' ')"
+              if [ -z "$FSTYPE" ]; then
+                echo ">>> Formatting $DATA_PART as ext4 ..."
+                sudo mkfs.ext4 -F "$DATA_PART"
+              else
+                echo ">>> $DATA_PART already has filesystem type: $FSTYPE"
+              fi
+
+              sudo mkdir -p /mnt
+              sudo mount "$DATA_PART" /mnt
+            fi
+          fi
+
+          echo ">>> Data mountpoint:"
+          df -h /mnt || true
+
+          # ===== 把当前仓库迁移到数据盘上，以后所有文件都放在数据盘 =====
+          echo ">>> Move GitHub workspace to data disk"
+
+          ORIG_WD="${GITHUB_WORKSPACE:-$(pwd)}"
+          echo "Original workspace: $ORIG_WD"
+
+          DATA_WORK_ROOT="/mnt/node-workspace"
+          DATA_REPO="${DATA_WORK_ROOT}/repo"
+
+          sudo mkdir -p "$DATA_WORK_ROOT"
+          sudo chown "$USER":"$USER" "$DATA_WORK_ROOT" || true
+
+          echo ">>> Sync repo to $DATA_REPO"
+          rsync -a "${ORIG_WD}/" "$DATA_REPO/"
+
+          echo ">>> Remove original workspace to free system disk"
+          rm -rf "$ORIG_WD"
+
+          cd "$DATA_REPO"
+          echo ">>> Now running in data-disk workspace: $(pwd)"
+
+          # 在 /mnt 上为 MCSM 准备目录，并把 /opt/mcsmanager 映射到数据盘
+          MCSM_DATA_DIR="/mnt/mcsm-data"
+          echo ">>> Prepare MCSM data dir at $MCSM_DATA_DIR (on data disk)"
+          sudo mkdir -p "$MCSM_DATA_DIR"
+          sudo chown "$USER":"$USER" "$MCSM_DATA_DIR" || true
+
+          if [ -e /opt/mcsmanager ] && [ ! -L /opt/mcsmanager ]; then
+            echo ">>> /opt/mcsmanager exists and is not a symlink, moving to data disk ..."
+            sudo mv /opt/mcsmanager "${MCSM_DATA_DIR}/mcsmanager_old"
+            sudo ln -s "${MCSM_DATA_DIR}/mcsmanager_old" /opt/mcsmanager
+          elif [ ! -e /opt/mcsmanager ]; then
+            echo ">>> Creating symlink /opt/mcsmanager -> ${MCSM_DATA_DIR}"
+            sudo mkdir -p /opt
+            sudo ln -s "$MCSM_DATA_DIR" /opt/mcsmanager
+          else
+            echo ">>> /opt/mcsmanager is already a symlink, keep it."
+          fi
+
+          echo ">>> Detect arch & download bore"
+          ARCH="$(uname -m)"
+          echo "Detected arch: $ARCH"
+
+          if [ "$ARCH" = "x86_64" ]; then
+            BORE_URL="https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz"
+          else
+            BORE_URL="https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-aarch64-unknown-linux-musl.tar.gz"
+          fi
+
+          echo "Downloading bore from $BORE_URL ..."
+          curl -L "$BORE_URL" -o bore.tar.gz
+
+          echo "Extract bore ..."
+          tar -xzf bore.tar.gz
+
+          if [ -f bore ]; then
+            :
+          else
+            BORE_BIN="$(find . -maxdepth 3 -type f -name 'bore' | head -n 1 || true)"
+            if [ -z "$BORE_BIN" ]; then
+              echo "Failed to find bore binary after extract."
+              ls -R .
+              exit 1
+            fi
+            mv "$BORE_BIN" bore
+          fi
+
+          chmod +x bore
+          echo ">>> bore installed (on data disk):"
+          ./bore --help >/dev/null 2>&1 || true
+
+          echo ">>> Configure & start OpenSSH server"
+          sudo mkdir -p /var/run/sshd
+
+          ROOT_PASS="$(openssl rand -base64 18 | tr -d '=+/' | head -c 16)"
+          echo "Generated root password (hidden for logs)"
+          echo "root:${ROOT_PASS}" | sudo chpasswd
+
+          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config || true
+
+          sudo /usr/sbin/sshd -D -e &
+          SSHD_PID=$!
+          echo ">>> sshd started with PID $SSHD_PID"
+
+          rm -f ssh.txt web.txt bore_*.log bore_ssh.log
+
+          echo ">>> Start bore tunnel for SSH (local port 22)"
+          nohup ./bore local 22 --to bore.pub > bore_ssh.log 2>&1 &
+
+          # 额外 TCP 端口（23333 面板 + 24444 远程 + 25565 游戏端口）
+          read -ra PORTS <<< "$PORT_LIST_STR"
+          if [ "${#PORTS[@]}" -gt 0 ]; then
+            echo ">>> Start bore tunnels for extra TCP ports ..."
+            for p in "${PORTS[@]}"; do
+              p_trim="$(echo "$p" | xargs || true)"
+              if [ -z "$p_trim" ]; then
+                continue
+              fi
+              log_file="bore_${p_trim}.log"
+              echo "  - launching bore tunnel for local port $p_trim ..."
+              nohup ./bore local "$p_trim" --to bore.pub > "$log_file" 2>&1 &
+            done
+          fi
+
+          echo ">>> Waiting for bore to establish tunnels ..."
+          sleep 10
+
+          SSH_HOST="nat.mugassn.dpdns.org"
+
+          # ===== SSH 远程端口（宽容，不让 grep 弄挂整个 job）=====
+          set +e
+          SSH_REMOTE_LINE="$(grep -Eo 'bore\.pub:[0-9]+' bore_ssh.log 2>/dev/null | head -n 1)"
+          set -e
+
+          if [ -n "$SSH_REMOTE_LINE" ]; then
+            SSH_REMOTE_PORT="${SSH_REMOTE_LINE##*:}"
+            SSH_CMD="ssh root@${SSH_HOST} -p ${SSH_REMOTE_PORT}"
+            echo ">>> SSH command: ${SSH_CMD}"
+
+            {
+              echo "${SSH_CMD}"
+              echo "password: ${ROOT_PASS}"
+            } > ssh.txt
+          else
+            echo "!!! 未能从 bore_ssh.log 中解析 SSH 远端端口"
+          fi
+
+          # ===== web.txt：把 23333 / 24444 / 25565 写进去，并带备注 =====
+          > web.txt
+          if [ "${#PORTS[@]}" -gt 0 ]; then
+            echo ">>> Parsing bore remote endpoints for extra ports ..."
+            for p in "${PORTS[@]}"; do
+              p_trim="$(echo "$p" | xargs || true)"
+              if [ -z "$p_trim" ]; then
+                continue
+              fi
+              log_file="bore_${p_trim}.log"
+              if [ -f "$log_file" ]; then
+                set +e
+                REMOTE_LINE="$(grep -Eo 'bore\.pub:[0-9]+' "$log_file" 2>/dev/null | head -n 1)"
+                set -e
+                if [ -n "$REMOTE_LINE" ]; then
+                  REMOTE_PORT="${REMOTE_LINE##*:}"
+                  PUBLIC="${SSH_HOST}:${REMOTE_PORT}"
+
+                  LABEL=""
+                  case "$p_trim" in
+                    23333)
+                      LABEL="MCSM 面板端口"
+                      ;;
+                    24444)
+                      LABEL="MCSM 远程连接端口"
+                      ;;
+                    25565)
+                      LABEL="MC 游戏端口"
+                      ;;
+                  esac
+
+                  echo ">>> Bore tunnel for local port ${p_trim}: ${PUBLIC} ${LABEL:+(# $LABEL)}"
+
+                  if [ -n "$LABEL" ]; then
+                    echo "${p_trim} ${PUBLIC} # ${LABEL}" >> web.txt
+                  else
+                    echo "${p_trim} ${PUBLIC}" >> web.txt
+                  fi
+                else
+                  echo "!!! 未能从 $log_file 中解析远端端口 (local=${p_trim})"
+                fi
+              else
+                echo "!!! bore 日志文件不存在: ${log_file}"
+              fi
+            done
+          fi
+
+          # ===== 安装 MCSM（官方一键脚本）=====
+          echo ">>> Install MCSManager (will use /opt/mcsmanager -> ${MCSM_DATA_DIR} on data disk)"
+          sudo su -c "wget -qO- https://script.mcsmanager.com/setup_cn.sh | bash"
+
+          echo ">>> Configure git & push ssh.txt / web.txt ..."
+          git config user.name "node-automation"
+          git config user.email "node-automation@noreply.local"
+
+          git add ssh.txt web.txt || true
+          TS="$(date -u +%Y%m%dT%H%M%SZ)"
+          git commit -m "chore: update node endpoints $TS" || echo "Nothing to commit"
+
+          REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push "$REMOTE_URL" HEAD:${GITHUB_REF_NAME} || echo "git push failed (non-fatal)"
+
+          echo ">>> TTL watcher (${TTL_MIN} minutes, bounded by workflow timeout) started"
+          sleep "$TTL_SEC" || true
+          echo ">>> TTL reached, stopping sshd ..."
+
+          if kill "$SSHD_PID" 2>/dev/null; then
+            echo "sshd stopped."
+          else
+            echo "sshd already stopped."
+          fi
+
+          echo ">>> Job finished."
