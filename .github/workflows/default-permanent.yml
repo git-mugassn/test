@@ -1,0 +1,270 @@
+﻿name: Permanent Windows Node
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart-permanent-windows]
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: permanent-windows-node
+  cancel-in-progress: true
+
+jobs:
+  debug:
+    runs-on: windows-2025
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configure RDP, start Serveo tunnel and save endpoints
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_TTL_MINUTES: "60"
+          NODE_WEB_PORTS: ""
+          NODE_REGION_ID: "wdc"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $TTL_MIN = [int]($env:NODE_TTL_MINUTES -replace '[^0-9]', '')
+          if ($TTL_MIN -lt 1) { $TTL_MIN = 60 }
+          $TTL_SEC = $TTL_MIN * 60
+
+          $REGION_ID = $env:NODE_REGION_ID
+          $REPO_NAME = $env:GITHUB_REPOSITORY -replace '^[^/]+/', ''
+          $SSH_SUBDOMAIN = if ($REGION_ID) { "$REGION_ID-$REPO_NAME" } else { $REPO_NAME }
+          $REMOTE_URL = "https://x-access-token:$($env:GITHUB_TOKEN)@github.com/$($env:GITHUB_REPOSITORY).git"
+
+          # ===== 安装并启动 OpenSSH Server =====
+          Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction SilentlyContinue
+          Start-Service sshd
+          Set-Service -Name sshd -StartupType Automatic
+          New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -ErrorAction SilentlyContinue
+
+          # ===== 初始化 reboot/shut 文件 =====
+          if (-not (Test-Path 'reboot.txt')) { Set-Content 'reboot.txt' "# 开机时可以在这里添加自定义启动命令`n# 例如：启动某个服务等" }
+          if (-not (Test-Path 'shut.txt'))   { Set-Content 'shut.txt'   "# 关机前可以在这里添加自定义关机命令`n# 例如：清理临时文件等" }
+
+          # ===== 创建数据目录 =====
+          New-Item -ItemType Directory -Force -Path "D:\data" | Out-Null
+
+          # ===== 恢复备份 =====
+          $RESTORE_PATH = "D:\"
+          $RELEASE_TAG = "backup"
+          $GH_HEADERS_RESTORE = @{ 'Authorization'="Bearer $($env:GITHUB_TOKEN)"; 'Accept'='application/vnd.github+json' }
+          $releaseInfoR = Invoke-RestMethod "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/releases/tags/$RELEASE_TAG" -Headers $GH_HEADERS_RESTORE -ErrorAction SilentlyContinue
+          if ($releaseInfoR.id) {
+            $assetsR = Invoke-RestMethod "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/releases/$($releaseInfoR.id)/assets" -Headers $GH_HEADERS_RESTORE -ErrorAction SilentlyContinue
+            $asset = $assetsR | Where-Object { $_.name -eq 'desktop_data.zip' } | Select-Object -First 1
+            if ($asset) {
+              Write-Host ">>> Restoring backup from release..."
+              $ZIP_DL = "$env:TEMP\desktop_data_restore.zip"
+              Invoke-WebRequest $asset.browser_download_url -OutFile $ZIP_DL -Headers @{ 'Authorization'="Bearer $($env:GITHUB_TOKEN)" } -ErrorAction SilentlyContinue
+              if (Test-Path $ZIP_DL) {
+                New-Item -ItemType Directory -Force -Path $RESTORE_PATH | Out-Null
+                Expand-Archive -Path $ZIP_DL -DestinationPath $RESTORE_PATH -Force
+                Remove-Item $ZIP_DL -ErrorAction SilentlyContinue
+                Write-Host ">>> Backup restored to $RESTORE_PATH"
+              }
+            }
+          }
+
+          # ===== 启用 RDP =====
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0
+
+          # 设置密码
+          $ROOT_PASS = ''
+          if (Test-Path 'ssh.txt') {
+            $line = Get-Content 'ssh.txt' | Where-Object { $_ -match 'password: ' } | Select-Object -First 1
+            if ($line) { $ROOT_PASS = $line -replace '.*password: ', '' }
+          }
+          if (-not $ROOT_PASS) {
+            $chars = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+            $ROOT_PASS = -join ((1..12) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+          }
+          # 创建 Mugassn 用户并加入管理员组
+          net user Mugassn $ROOT_PASS /add /y 2>$null
+          net localgroup Administrators Mugassn /add 2>$null
+          net localgroup "Remote Desktop Users" Mugassn /add 2>$null
+          $CURRENT_USER = 'Mugassn'
+
+          # ===== Serveo 客户端密钥 =====
+          $SSH_DIR = "$env:USERPROFILE\.ssh"
+          New-Item -ItemType Directory -Force -Path $SSH_DIR | Out-Null
+          $SERVEO_KEY = "$SSH_DIR\serveo_client_key"
+          $SERVEO_KEY_FILE = 'key.txt'
+          $SERVEO_FP_FILE = 'fingerprint.txt'
+
+          if (Test-Path $SERVEO_KEY_FILE) {
+            Get-Content $SERVEO_KEY_FILE -Raw | Set-Content $SERVEO_KEY -NoNewline
+            icacls $SERVEO_KEY /inheritance:r /grant:r "${env:USERNAME}:F" | Out-Null
+          } else {
+            ssh-keygen -t ed25519 -f $SERVEO_KEY -N '""' -C "serveo-client-$REPO_NAME"
+            Get-Content $SERVEO_KEY -Raw | Set-Content $SERVEO_KEY_FILE -NoNewline
+            $fp = (ssh-keygen -lf $SERVEO_KEY) -split ' ' | Select-Object -Index 1
+            Set-Content $SERVEO_FP_FILE $fp
+
+            git config user.name 'permanent-node-automation'
+            git config user.email 'permanent-node-automation@noreply.local'
+            git add $SERVEO_KEY_FILE $SERVEO_FP_FILE 2>$null
+            git commit -m 'chore: add serveo client key and fingerprint' 2>$null
+            git pull --rebase $REMOTE_URL $env:GITHUB_REF_NAME 2>$null
+            git push $REMOTE_URL "HEAD:$($env:GITHUB_REF_NAME)" 2>$null
+          }
+
+          # SSH config
+          $SSH_CONFIG = "$SSH_DIR\config"
+          $sshConfigContent = "Host serveo.net`n    StrictHostKeyChecking no`n    UserKnownHostsFile NUL`n    ServerAliveInterval 60`n    ServerAliveCountMax 3`n    IdentityFile $SERVEO_KEY"
+          Set-Content $SSH_CONFIG $sshConfigContent
+
+          # ===== 配置 Cloudflare DNS TXT（用于 Serveo 认证）=====
+          $SERVEO_FP = ''
+          if (Test-Path $SERVEO_FP_FILE) { $SERVEO_FP = (Get-Content $SERVEO_FP_FILE).Trim() }
+
+          if ($SERVEO_FP) {
+            $CF_TOKEN = 'yHCjTnrTBDdlXq8FBdUho9gmolBVb1cRO-HUrNjs'
+            $CF_ZONE  = '1381075946420150b48ef98ef234ca0b'
+            $CF_DOMAIN = 'mugassn.dpdns.org'
+            $TXT_NAME = "_serveo-authkey.$SSH_SUBDOMAIN"
+            $FULL_NAME = "$TXT_NAME.$CF_DOMAIN"
+            $HEADERS = @{ 'Authorization' = "Bearer $CF_TOKEN"; 'Content-Type' = 'application/json' }
+
+            $check = Invoke-RestMethod "https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records?type=TXT&name=$FULL_NAME" -Headers $HEADERS -ErrorAction SilentlyContinue
+            $RID = $check.result[0].id
+
+            $body = @{ type='TXT'; name=$TXT_NAME; content="`"$SERVEO_FP`""; ttl=300; proxied=$false } | ConvertTo-Json
+            if ($RID) {
+              Invoke-RestMethod "https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records/$RID" -Method PUT -Headers $HEADERS -Body $body -ErrorAction SilentlyContinue | Out-Null
+            } else {
+              Invoke-RestMethod "https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records" -Method POST -Headers $HEADERS -Body $body -ErrorAction SilentlyContinue | Out-Null
+            }
+            Start-Sleep 30
+          }
+
+          # ===== 启动 Serveo SSH 隧道（SSH 22 + RDP 3389）=====
+          $serveoJob = Start-Process ssh -ArgumentList "-i `"$SERVEO_KEY`" -o StrictHostKeyChecking=no -o ServerAliveInterval=60 -R `"${SSH_SUBDOMAIN}:22:localhost:22`" -R `"${SSH_SUBDOMAIN}:3389:localhost:3389`" serveo.net" -RedirectStandardOutput 'serveo_ssh.log' -RedirectStandardError 'serveo_ssh_err.log' -WindowStyle Hidden -PassThru
+
+          # ===== 解析 web.txt 里已有的域名配置 =====
+          $PORT_DOMAINS = @{}
+          if (Test-Path 'web.txt') {
+            Get-Content 'web.txt' | ForEach-Object {
+              $line = $_.Trim()
+              if ($line -match '^(\d+)\s+https?://([^\s]+)') {
+                $PORT_DOMAINS[$matches[1]] = $matches[2]
+              }
+            }
+          }
+
+          # ===== 启动 HTTP 端口映射隧道 =====
+          $PORT_LIST = ($env:NODE_WEB_PORTS -split '\s+' | Where-Object { $_ -match '^\d+$' })
+          if ($PORT_LIST.Count -eq 0 -and $PORT_DOMAINS.Count -gt 0) {
+            $PORT_LIST = @($PORT_DOMAINS.Keys)
+          }
+          foreach ($p in $PORT_LIST) {
+            if ($PORT_DOMAINS.ContainsKey($p)) {
+              $DOMAIN = $PORT_DOMAINS[$p] -replace '^https?://', ''
+            } else {
+              $DOMAIN = if ($env:NODE_REGION_ID) { "$($env:NODE_REGION_ID)-default-$REPO_NAME.mugassn.dpdns.org" } else { "default-$REPO_NAME.mugassn.dpdns.org" }
+            }
+            Start-Process ssh -ArgumentList "-i `"$SERVEO_KEY`" -o StrictHostKeyChecking=no -o ServerAliveInterval=60 -R `"${DOMAIN}:80:localhost:${p}`" serveo.net" -RedirectStandardOutput "serveo_${p}.log" -RedirectStandardError "serveo_${p}_err.log" -WindowStyle Hidden | Out-Null
+          }
+          Start-Sleep 10
+
+          # ===== 保存连接信息 =====
+          Remove-Item 'ssh.txt' -ErrorAction SilentlyContinue
+          $rdpContent = "SSH: ssh -J host.mugassn.dpdns.org ${CURRENT_USER}@$SSH_SUBDOMAIN`nRDP step1: ssh -L 33389:${SSH_SUBDOMAIN}:3389 host.mugassn.dpdns.org`nRDP step2: mstsc /v:localhost:33389`nusername: $CURRENT_USER`npassword: $ROOT_PASS"
+          Set-Content 'ssh.txt' $rdpContent
+
+          # ===== 生成 web.txt =====
+          if (-not (Test-Path 'web.txt') -and $PORT_LIST.Count -gt 0) {
+            $webLines = @()
+            foreach ($p in $PORT_LIST) {
+              $SUBDOMAIN = if ($env:NODE_REGION_ID) { "$($env:NODE_REGION_ID)-default-$REPO_NAME" } else { "default-$REPO_NAME" }
+              $webLines += "$p http://${SUBDOMAIN}.mugassn.dpdns.org"
+            }
+            Set-Content 'web.txt' ($webLines -join "`n")
+          }
+
+          git config user.name 'permanent-node-automation'
+          git config user.email 'permanent-node-automation@noreply.local'
+          foreach ($f in @('ssh.txt', 'web.txt', 'key.txt', 'fingerprint.txt', 'reboot.txt', 'shut.txt')) {
+            if (Test-Path $f) { git add $f 2>$null }
+          }
+          git commit -m "chore: update windows node endpoints $(Get-Date -Format 'yyyyMMddTHHmmssZ' -AsUTC)" 2>$null
+          git pull --rebase $REMOTE_URL $env:GITHUB_REF_NAME 2>$null
+          git push $REMOTE_URL "HEAD:$($env:GITHUB_REF_NAME)" 2>$null
+
+          Write-Host ">>> Windows node ready! Running for $TTL_MIN minutes..."
+
+          # ===== 等待 TTL =====
+          $elapsed = 0
+          while ($elapsed -lt $TTL_SEC) {
+            Start-Sleep 60
+            $elapsed += 60
+            Write-Host ">>> Running... ($([int]($elapsed/60)) / $TTL_MIN minutes elapsed)"
+          }
+
+          # ===== 备份 D:\data 到 Release =====
+          $BACKUP_PATH = "D:\data"
+          $RELEASE_TAG = "backup"
+          $GH_HEADERS = @{
+            'Authorization' = "Bearer $($env:GITHUB_TOKEN)"
+            'Accept' = 'application/vnd.github+json'
+            'Content-Type' = 'application/json'
+          }
+
+          if (Test-Path $BACKUP_PATH) {
+            Write-Host ">>> Backing up $BACKUP_PATH ..."
+            $ZIP_PATH = "$env:TEMP\desktop_data.zip"
+            Remove-Item $ZIP_PATH -ErrorAction SilentlyContinue
+            Compress-Archive -Path $BACKUP_PATH -DestinationPath $ZIP_PATH -Force
+
+            # 获取或创建 release
+            $releaseInfo = Invoke-RestMethod "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/releases/tags/$RELEASE_TAG" -Headers $GH_HEADERS -ErrorAction SilentlyContinue
+            $RELEASE_ID = $releaseInfo.id
+            if (-not $RELEASE_ID) {
+              $createBody = @{ tag_name=$RELEASE_TAG; target_commitish=$env:GITHUB_REF_NAME; name='Backup'; body=''; draft=$false; prerelease=$true } | ConvertTo-Json
+              $releaseInfo = Invoke-RestMethod "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/releases" -Method POST -Headers $GH_HEADERS -Body $createBody
+              $RELEASE_ID = $releaseInfo.id
+            }
+
+            if ($RELEASE_ID) {
+              # 删除同名旧 asset
+              $assets = Invoke-RestMethod "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/releases/$RELEASE_ID/assets" -Headers $GH_HEADERS -ErrorAction SilentlyContinue
+              $oldAsset = $assets | Where-Object { $_.name -eq 'desktop_data.zip' } | Select-Object -First 1
+              if ($oldAsset) {
+                Invoke-RestMethod "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/releases/assets/$($oldAsset.id)" -Method DELETE -Headers $GH_HEADERS -ErrorAction SilentlyContinue | Out-Null
+              }
+              # 上传
+              $uploadHeaders = @{ 'Authorization'="Bearer $($env:GITHUB_TOKEN)"; 'Accept'='application/vnd.github+json'; 'Content-Type'='application/zip' }
+              $uploadResp = Invoke-RestMethod "https://uploads.github.com/repos/$($env:GITHUB_REPOSITORY)/releases/$RELEASE_ID/assets?name=desktop_data.zip" -Method POST -Headers $uploadHeaders -InFile $ZIP_PATH -ErrorAction SilentlyContinue
+              if ($uploadResp.browser_download_url) {
+                Write-Host ">>> Backup uploaded: $($uploadResp.browser_download_url)"
+              } else {
+                Write-Host "!!! Backup upload failed"
+              }
+            }
+            Remove-Item $ZIP_PATH -ErrorAction SilentlyContinue
+          } else {
+            Write-Host ">>> Backup path not found, skipping: $BACKUP_PATH"
+          }
+
+          # ===== 轮换重启 =====
+          Start-Sleep 60
+          $body = '{"event_type":"restart-permanent-windows"}' 
+          Invoke-RestMethod "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/dispatches" `
+            -Method POST `
+            -Headers @{ 'Authorization'="Bearer $($env:GITHUB_TOKEN)"; 'Accept'='application/vnd.github+json'; 'Content-Type'='application/json' } `
+            -Body $body -ErrorAction SilentlyContinue | Out-Null
+
+          Start-Sleep 180
